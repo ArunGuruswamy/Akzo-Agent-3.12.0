@@ -2,6 +2,26 @@
 
 Akzo SDD Agent — Developed and maintained by Arun RG. The version is in `VERSION`; `install.ps1 -Verify` shows the installed and available versions.
 
+## 3.12.0 — 2026-10-29 (proposed)
+Lessons from PR reviews prevent the same mistake in later PBIs; test evidence must be fresh. Built on the verified 3.11.0 (386 passed, 0 failed; zip SHA-256 0FD3A858...49BA). Gates G1-G5 and G8, `decide`, `guard`, the built-in review scenarios, trace statuses, repository memory, and profile isolation are unchanged. No new dependency, tool, or network call; nothing is written to Copilot instructions, skills, or memory.
+
+**Added**
+- `lesson -Repo <id> -Action add|approve|reject|list|report` and `<AKZO_HOME>\learning\<repo-id>.json` (one file per repository). Why a new file: `review-rules.json` holds line patterns only; a lesson also keeps the review history (comment, PR reference, root cause, verified correction, evidence, classification, approval) and checks a regex cannot express.
+  - `add` records a review comment (secrets redacted, instruction-like text flagged; comments are data). Classification: ONE_TIME_FIX, REUSABLE_PATTERN, PROJECT_SPECIFIC_RULE, BUSINESS_RULE_CLARIFICATION, UNVERIFIED_FEEDBACK (no verified correction, or instruction-like text). Equivalent comments group under one lesson, by the pattern catalog `profiles\lesson-patterns.json` (stemmed topic and signal words) or by wording close to an earlier lesson; the same comment twice is a duplicate; a contradicting classification or check is a conflict.
+  - `approve` (only on the developer's word) refuses unverified, non-reusable, conflicting, already approved, check-less, and duplicate rules. A line-pattern lesson is written into the existing `profiles-custom\review-rules.json`.
+  - `report`: comments analyzed, verified patterns, rules proposed / approved / rejected or blocked, rules reused, violations detected and fixed before the PR (from the recorded review runs), remaining recurring issues; "NOT YET MEASURABLE" without an approved lesson and a review since.
+- `review` applies approved lessons: a new type that repeats a corrected mistake (for example a second validation service while one exists) is an error `lesson:<KEY>` naming the existing component and the original PR. Lessons of another repository or profile are never applied; an unreadable lessons file is a warning.
+- `task` returns `lessons` (the repository's approved lessons) for the plan's new Prevention section.
+- `trace` returns `evidence` (branch, HEAD, results time, latest source change, `stale`) and a `readiness` per AC: IMPLEMENTED_AND_VERIFIED, IMPLEMENTED_NOT_TESTED, PARTIALLY_IMPLEMENTED, MISSING, BLOCKED, NOT_VERIFIED. Results older than the latest code change, or whose freshness cannot be checked, never count as verified. The statuses COVERED / FAILING / NOT RUN / MISSING are unchanged. `prtext` shows readiness.
+
+**Changed**
+- Agent: Fix PR comments records each verified comment with `lesson` and approves a rule only on the developer's word (this replaces 3.11.0's "propose the rule as text"; its check was updated with it); approved lessons are applied in planning without asking again; fresh test evidence before anything is called done; DAB only / CDMS only / Both, with every CDMS behavior (plugin, JavaScript, workflow) mapped to a DAB, API, or Angular step.
+- Plan template: Prevention table (approved lessons), Target and the CDMS-to-DAB mapping table.
+
+**Tests:** 397 passed, 0 failed (11 new checks: the end-to-end scenario of a duplicate validation service caught in PR review, recorded, approved, and prevented in the next PBI; grouping and duplicates; the report; unverified, instruction-like, business, conflicting, and duplicate-rule feedback never promoted; a line-pattern lesson written to the review rules and applied; repository and profile isolation; a damaged lessons file; lessons in planning; trace readiness and stale evidence). Window tests 14 passed, 0 failed.
+
+**NOT VERIFIED:** how Copilot follows the learning instructions in a live session; lessons from real DAB, CDMS, and Angular PR reviews (the scenario is a deterministic fixture); GitHub comment retrieval (feedback is pasted or read by a pull-request tool in chat, never fetched by the helper); Visual Studio 2026.
+
 ## 3.11.0 — 2026-10-29
 Change risk, acceptance-criteria trace, PR text, custom review rules, and a per-repository coverage threshold. Gates G1-G5 and G8, `decide`, `guard`, repository memory, and profile isolation are unchanged. No new dependency, tool, or network call.
 

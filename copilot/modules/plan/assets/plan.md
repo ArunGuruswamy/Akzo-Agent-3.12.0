@@ -21,6 +21,14 @@ Spec: ./spec.md · Task folder: <path> · Evidence: <task folder>/evidence/
 |----|------------------------------------------------------------------------|----------|----------|--------------|
 | C1 | | | | |
 
+Prevention (approved lessons from `task`; `review` reports a repeat as `lesson:<KEY>`):
+| Lesson | How this plan applies it (existing component reused, `path`) |
+|--------|---------------------------------------------------------------|
+
+Target: new implementation only | legacy implementation only | both. For both, every legacy behavior (plugin, client script, workflow, validation, transformation, status transition) maps to a step in the new implementation, an API, or the UI; a task table per repository.
+| Legacy behavior (`path`) | New implementation, API, or UI step (layer, file) | Task | Status (planned / MISSING) |
+|------------------------|----------------------------------------|------|----------------------------|
+
 ## 2. Tasks
 Order matters. Every file listed was found in the repo (no invented paths); new files name the existing pattern they copy.
 Task: a descriptive title taken from the work itself (e.g. "Implement reference color lookup"); people see this title, the T id stays internal. Objective: what the task delivers and why the PBI needs it.

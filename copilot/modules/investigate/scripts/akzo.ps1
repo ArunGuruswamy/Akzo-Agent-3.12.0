@@ -47,7 +47,7 @@
 #>
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet('home', 'registry', 'state', 'inbox', 'pick', 'intake', 'attach', 'role', 'discover', 'task', 'graph', 'sonar', 'coverage', 'remember', 'forget', 'context', 'policy', 'authorize', 'guard', 'scan', 'security', 'purge', 'branchinfo', 'branchcreate', 'branchuse', 'tasks', 'snapshot', 'profile', 'review', 'affected', 'guidance', 'decide', 'trace', 'prtext')]
+    [ValidateSet('home', 'registry', 'state', 'inbox', 'pick', 'intake', 'attach', 'role', 'discover', 'task', 'graph', 'sonar', 'coverage', 'remember', 'forget', 'context', 'policy', 'authorize', 'guard', 'scan', 'security', 'purge', 'branchinfo', 'branchcreate', 'branchuse', 'tasks', 'snapshot', 'profile', 'review', 'affected', 'guidance', 'decide', 'trace', 'prtext', 'lesson')]
     [string]$Command,
     [string]$Reference,       # authorize: the approval you hold (ticket, policy, or approver)
     [string]$Classification,  # authorize: public | internal | confidential (restricted needs an administrator policy)
@@ -98,7 +98,11 @@ param(
     [string]$Gate = '',    # decide: the gate the developer decided on
     [ValidateSet('', 'approve', 'changes', 'custom')]
     [Alias('Decision')]   # not $Decision: PowerShell names are case-insensitive and branchuse assigns $decision
-    [string]$GateDecision = '' # decide: the choice the developer made (never inferred from an ambiguous reply)
+    [string]$GateDecision = '', # decide: the choice the developer made (never inferred from an ambiguous reply)
+    [ValidateSet('', 'add', 'approve', 'reject', 'list', 'report')]
+    [string]$Action = '',  # lesson: what to do with PR review feedback (approve / reject only on the developer's word)
+    [string]$Cause,        # lesson add: why the reviewed code was wrong (the verified root cause)
+    [string]$Correction    # lesson add: what the verified fix changed
 )
 $ErrorActionPreference = 'Stop'
 if ($Rest -and $Command -ne 'guard') { throw "Unexpected argument(s) for '$Command': $($Rest -join ' ')" }   # stray arguments stay an error everywhere but guard
@@ -1268,7 +1272,7 @@ function Get-Trace([string]$specDir, $results) {   # ACs of spec.md -> the tests
         foreach ($l in [IO.File]::ReadAllLines($plan)) {
             $cells = @($l.Trim().Trim('|').Split('|') | ForEach-Object { $_.Trim() })
             if (-not $col) {
-                if ($l -match '^\|.*\|\s*Test \(file::name\)\s*\|') { $col = @{}; for ($i = 0; $i -lt $cells.Count; $i++) { if ($cells[$i] -eq 'AC') { $col.ac = $i } elseif ($cells[$i] -eq 'REQ') { $col.req = $i } elseif ($cells[$i] -like 'Test (*') { $col.test = $i } } }
+                if ($l -match '^\|.*\|\s*Test \(file::name\)\s*\|') { $col = @{}; for ($i = 0; $i -lt $cells.Count; $i++) { if ($cells[$i] -eq 'AC') { $col.ac = $i } elseif ($cells[$i] -eq 'REQ') { $col.req = $i } elseif ($cells[$i] -like 'Test (*') { $col.test = $i } elseif ($cells[$i] -like 'Code*') { $col.code = $i } } }
                 continue
             }
             if ($l -notmatch '^\s*\|') { break }   # the matrix ended
@@ -1276,6 +1280,7 @@ function Get-Trace([string]$specDir, $results) {   # ACs of spec.md -> the tests
             foreach ($a in [regex]::Matches("$($cells[$col.ac])", '(?i)AC[\s-]?\d+')) {
                 $k = & $norm $a.Value
                 if (-not $acs.Contains($k)) { $acs[$k] = @{ req = "$($cells[$col.req])"; tests = New-Object Collections.Generic.List[string] } }
+                if ($null -ne $col.code -and "$($cells[$col.code])" -match '\w' -and "$($cells[$col.code])" -notmatch '^(-|—|n/?a|none)$') { $acs[$k].code = "$($cells[$col.code])" }
                 foreach ($t in ("$($cells[$col.test])" -split ',|;|<br\s*/?>')) { $t = $t.Trim().Trim('`').Trim(); if ($t -and $t -notmatch '^(-|—|n/?a|none)$') { $acs[$k].tests.Add($t) } }
             }
         }
@@ -1293,15 +1298,15 @@ function Get-Trace([string]$specDir, $results) {   # ACs of spec.md -> the tests
                 $o = if (-not $hits.Count) { 'not found' } elseif ($hits.Count -gt 1) { "ambiguous: $($hits -join ', ')" } else { "$($results[$hits[0]].outcome)" }
                 [pscustomobject][ordered]@{ test = (Protect-Text $t); outcome = $o; matched = $(if ($hits.Count -eq 1) { $hits[0] } else { '' }) } })
         $st = if (-not $tests.Count) { 'MISSING' } elseif (@($tests | Where-Object { $_.outcome -match '^(Failed|Error|Timeout|Aborted)$' }).Count) { 'FAILING' } elseif (-not @($tests | Where-Object { $_.outcome -ne 'Passed' }).Count) { 'COVERED' } else { 'NOT RUN' }
-        [pscustomobject][ordered]@{ ac = $k; req = $acs[$k].req; status = $st; tests = $tests }
+        [pscustomobject][ordered]@{ ac = $k; req = $acs[$k].req; status = $st; code = "$($acs[$k].code)"; tests = $tests }
     }
 }
 function Get-TraceReport([string]$dir, [string]$resultsPath) {   # trace output for one task folder; results from -Path, else the evidence folder and the repository's TestResults
     $j = try { Get-Content -LiteralPath (Join-Path $dir 'task.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $null }
     $sd = if ($j.specDir) { "$($j.specDir)" } else { $dir }
+    $rr = Get-Registry | Where-Object { $_.id -eq (Split-Path (Split-Path $dir) -Leaf) } | Select-Object -First 1
     $roots = @(if ($resultsPath) { $resultsPath.Trim('"') } else {
             # shortcut: walks the whole repository for TestResults folders; pass -Path when that is slow
-            $rr = Get-Registry | Where-Object { $_.id -eq (Split-Path (Split-Path $dir) -Leaf) } | Select-Object -First 1
             Join-Path $dir 'evidence'
             if ($rr -and (Test-Dir $rr.path)) { Get-ChildItem -LiteralPath $rr.path -Recurse -Directory -Filter TestResults -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName } } })
     if ($resultsPath -and -not (Test-Path -LiteralPath $roots[0])) { throw "-Path '$resultsPath' was not found." }
@@ -1310,9 +1315,39 @@ function Get-TraceReport([string]$dir, [string]$resultsPath) {   # trace output 
     $cnt = { param($s) @($acs | Where-Object { $_.status -eq $s }).Count }
     $missing = & $cnt 'MISSING'; $failing = & $cnt 'FAILING'; $notRun = & $cnt 'NOT RUN'
     $status = if (-not $acs.Count) { 'NO_ACS' } elseif ($missing -or $failing) { 'BLOCKED' } elseif ($notRun) { 'NOT_RUN' } else { 'COVERED' }
+    # Freshness: results older than the newest source change (HEAD commit or an uncommitted edit) do not prove the current code.
+    $ev = [ordered]@{ repo = "$($rr.id)"; branch = ''; head = ''; resultsAt = ''; latestSourceChange = ''; stale = $null; reason = '' }
+    $newest = @($trx | ForEach-Object { (Get-Item -LiteralPath $_).LastWriteTime } | Sort-Object)[-1]
+    if ($rr -and (Test-Dir $rr.path)) {
+        $ev.branch = "$(Invoke-Quiet git -C $rr.path rev-parse --abbrev-ref HEAD)"; $ev.head = "$(Invoke-Quiet git -C $rr.path rev-parse --short HEAD)"
+        $ct = "$(Invoke-Quiet git -C $rr.path log -1 --format=%ct)"
+        $changes = @(if ($ct -match '^\d+$') { [DateTimeOffset]::FromUnixTimeSeconds([long]$ct).LocalDateTime })
+        foreach ($s in @(Invoke-Quiet git -C $rr.path -c core.quotepath=off status --porcelain=v1 -uall)) {
+            $f = ($s.Substring(3) -split ' -> ')[-1].Trim('"')
+            if ($f -match '(?i)(^|/)(TestResults|bin|obj)/|\.trx$') { continue }   # outputs of the test run itself
+            $full = Join-Path $rr.path $f; if (Test-Path -LiteralPath $full -PathType Leaf) { $changes += (Get-Item -LiteralPath $full).LastWriteTime }
+        }
+        $latest = @($changes | Sort-Object)[-1]
+        if ($latest) { $ev.latestSourceChange = $latest.ToString('s') }
+        if ($newest) { $ev.resultsAt = $newest.ToString('s'); $ev.stale = [bool]($latest -and $latest -gt $newest); if ($ev.stale) { $ev.reason = 'the code changed after the newest test results; run the tests again' } }
+        else { $ev.reason = 'no test results' }
+    } else { $ev.reason = 'the repository is not registered, so freshness cannot be checked'; if ($newest) { $ev.resultsAt = $newest.ToString('s') } }
+    # Readiness (separate from status): implementation evidence per AC; stale or missing results never count as verified.
+    foreach ($a in $acs) {
+        $passed = @($a.tests | Where-Object { $_.outcome -eq 'Passed' }).Count
+        $rd = switch ($a.status) {
+            'COVERED' { if ($ev.stale -eq $false) { 'IMPLEMENTED_AND_VERIFIED' } else { 'NOT_VERIFIED' } }
+            'FAILING' { 'BLOCKED' }
+            'NOT RUN' { if ($passed) { 'PARTIALLY_IMPLEMENTED' } elseif ($a.code) { 'IMPLEMENTED_NOT_TESTED' } else { 'NOT_VERIFIED' } }
+            default { if ($a.code) { 'IMPLEMENTED_NOT_TESTED' } else { 'MISSING' } } }
+        $a | Add-Member -Force NoteProperty readiness $rd
+    }
     [pscustomobject][ordered]@{ status = $status; pbi = (Split-Path $dir -Leaf); spec = (Join-Path $sd 'spec.md'); plan = (Join-Path $sd 'plan.md'); searched = $roots
         results = @($trx | ForEach-Object { [pscustomobject]@{ file = $_; written = (Get-Item -LiteralPath $_).LastWriteTime.ToString('yyyy-MM-dd HH:mm') } })
         counts = [ordered]@{ covered = (& $cnt 'COVERED'); failing = $failing; notRun = $notRun; missing = $missing }
+        evidence = $ev
+        readiness = [ordered]@{ verified = @($acs | Where-Object { $_.readiness -eq 'IMPLEMENTED_AND_VERIFIED' }).Count; notVerified = @($acs | Where-Object { $_.readiness -ne 'IMPLEMENTED_AND_VERIFIED' }).Count
+            ready = [bool]($acs.Count -and -not @($acs | Where-Object { $_.readiness -ne 'IMPLEMENTED_AND_VERIFIED' }).Count) }
         acs = $acs
         next = $(switch ($status) {
                 'NO_ACS' { 'spec.md has no acceptance criteria rows (| AC1 | REQ-1 | ... |); write them before tracing.' }
@@ -1320,6 +1355,41 @@ function Get-TraceReport([string]$dir, [string]$resultsPath) {   # trace output 
                 'NOT_RUN' { 'Run the listed tests so their TRX results exist, then trace again; an ambiguous or not-found name needs the exact file::name.' }
                 default { 'Every AC has a passing test: build the handover matrix from this output.' } })
     }
+}
+
+# ---- Lessons from PR reviews (3.12.0) ---------------------------------------------------------------------------
+# One file per repository. review-rules.json holds line patterns only; a lesson also keeps the review history (comment,
+# reference, root cause, verified correction, evidence, approval) and checks a regex cannot express ("a new X while an
+# existing X does the same"). A lesson is applied only after the developer approves it.
+function Get-LessonFile([string]$repoId) { Join-Path $LearningDir "$($repoId -replace '[^\w.-]', '_').json" }
+function Read-Lessons([string]$repoId) {   # an unreadable file is reported, never rewritten or silently replaced
+    $f = Get-LessonFile $repoId
+    if (-not (Test-Path -LiteralPath $f)) { return [pscustomobject]@{ file = $f; lessons = @(); error = '' } }
+    try { $j = Get-Content -LiteralPath $f -Raw -Encoding UTF8 | ConvertFrom-Json; [pscustomobject]@{ file = $f; lessons = @(foreach ($l in $j.lessons) { if ($l.key) { $l } }); error = '' } }
+    catch { [pscustomobject]@{ file = $f; lessons = @(); error = $_.Exception.Message } }
+}
+function Save-Lessons([string]$file, $lessons) {
+    New-Item -ItemType Directory -Force (Split-Path $file) | Out-Null
+    $arr = @(foreach ($x in $lessons) { $x })   # a plain array: 5.1's ConvertTo-Json fails on @() of a generic List ("Argument types do not match")
+    Write-TextAtomic $file ([pscustomobject][ordered]@{ version = 1; lessons = $arr } | ConvertTo-Json -Depth 8)
+}
+function Read-LessonPatterns {   # known review patterns (profiles\lesson-patterns.json, or its profiles-custom copy)
+    $p = (Get-ProfileFile 'lesson-patterns.json').path
+    try { @(foreach ($x in (Get-Content -LiteralPath $p -Raw -Encoding UTF8 | ConvertFrom-Json)) { $x }) } catch { @() }
+}
+function Test-AnyToken($tokens, [string]$words) { foreach ($w in @(Get-Tokens $words)) { if ($tokens -contains $w) { return $true } }; $false }
+function Test-LessonCheck($check) {   # '' when the check can run, else why not
+    if (-not $check) { return 'no check' }
+    switch ("$($check.kind)") {
+        'reuse-before-new' { $rx = "$($check.typePattern)" }
+        'regex' { $rx = "$($check.regex)" }
+        default { return "check kind '$($check.kind)' is not reuse-before-new or regex" } }
+    if (-not $rx) { return 'the check has no pattern' }
+    try { [void][regex]::new($rx); '' } catch { "the pattern does not compile ($($_.Exception.GetBaseException().Message))" }
+}
+function Get-CheckId($c) { if ($c) { "$($c.kind)|$($c.typePattern)|$($c.regex)" } else { '' } }   # what a check matches, ignoring how it was written
+function Get-LessonSummary([string]$repoId) {   # approved lessons, one line each, for planning (task output)
+    @((Read-Lessons $repoId).lessons | Where-Object { $_.status -eq 'approved' } | ForEach-Object { "$($_.key): $($_.title)" })
 }
 function Update-TaskJson([string]$dir, [hashtable]$set) {   # merge keys into task.json; other keys are kept
     $f = Join-Path $dir 'task.json'
@@ -1420,6 +1490,8 @@ function Test-BranchName([string]$n) {
 # solution file is in the repository; package, file, and code markers are supporting evidence, never enough alone.
 $ProfilesDir = Join-Path $ModulesDir 'profiles'
 $CustomProfilesDir = Join-Path $AkzoHome 'profiles-custom'   # the developer's own versions; the installer never writes here
+$LearningDir = Join-Path $AkzoHome 'learning'   # lessons from PR reviews, one file per repository; the installer never writes here
+$LessonClasses = 'ONE_TIME_FIX', 'REUSABLE_PATTERN', 'PROJECT_SPECIFIC_RULE', 'BUSINESS_RULE_CLARIFICATION', 'UNVERIFIED_FEEDBACK'
 function Read-Profiles {
     $p = Join-Path $ProfilesDir 'profiles.json'
     if (-not (Test-Path -LiteralPath $p)) { return $null }
@@ -1765,6 +1837,29 @@ function Get-ReviewFindings($r, $def, [string]$against) {
             $name = $Matches[1]
             $users = @(Invoke-Quiet git -C $root -c core.quotepath=off grep -l --untracked -w -F $name -- '*.cs' | Where-Object { $_ -ne $p -and $_ -notmatch $testRx -and $_ -notmatch $genRx })
             if ($users.Count -le 1) { & $add 'single-use-abstraction' 'warning' $p ($i + 1) "New type $name is used by $(if ($users.Count) { "only $($users[0])" } else { 'no other production file' }). Reuse an existing equivalent or keep the logic with its one consumer, unless sibling features use the same kind of type." '' }
+        }
+    }
+
+    # Approved lessons from earlier PR reviews of this repository: a new type that repeats a corrected mistake is an error.
+    $ls = Read-Lessons $r.id
+    if ($ls.error) { & $add 'lesson-file-invalid' 'warning' $ls.file 0 "The lessons file cannot be read ($($ls.error)); no lesson was applied. Restore or fix it." '' }
+    $declRx = '^\s*(?:(?:public|internal|sealed|static|partial|abstract)\s+)*(?:class|interface|record)\s+(\w+)'
+    $decls = $null
+    foreach ($l in @($ls.lessons | Where-Object { $_.status -eq 'approved' -and "$($_.check.kind)" -eq 'reuse-before-new' -and -not (Test-LessonCheck $_.check) -and ("$($_.profile)" -in '', 'shared' -or "$($_.profile)" -eq "$($def.id)") })) {
+        $tp = "$($l.check.typePattern)"
+        $ref = "$(@($l.occurrences | ForEach-Object { $_.reference } | Where-Object { $_ }) | Select-Object -First 1)"
+        foreach ($p in @($prod | Where-Object { & $isNew $_ })) {
+            for ($i = 0; $i -lt $lines[$p].Count; $i++) {
+                if ($lines[$p][$i] -notmatch $declRx) { continue }
+                $nm = $Matches[1]; if ($nm -notmatch $tp) { continue }
+                if ($null -eq $decls) {   # every type declared in tracked production code, read once and only when needed
+                    $decls = @(foreach ($g in @(Invoke-Quiet git -C $root -c core.quotepath=off grep -n -E '(class|interface|record)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' -- '*.cs')) {
+                            if ($g -match '^(.+?):(\d+):(.*)$' -and $Matches[3] -match $declRx) { [pscustomobject]@{ file = ($g -split ':\d+:', 2)[0]; name = $Matches[1] } } })
+                    $decls = @($decls | Where-Object { $_.file -notmatch $testRx -and $_.file -notmatch $genRx -and -not ($set.ContainsKey($_.file) -and (& $isNew $_.file)) })
+                }
+                $same = @($decls | Where-Object { $_.name -ne $nm -and $_.name -match $tp } | Sort-Object { $_.name -like 'I*' }, file)
+                if ($same.Count) { & $add "lesson:$($l.key)" 'error' $p ($i + 1) "New type $nm repeats a mistake corrected in an earlier PR review$(if ($ref) { " ($ref)" }): $($l.title) $($same[0].name) in $($same[0].file) already exists; reuse it, or record in the plan why it cannot serve this case." '' }
+            }
         }
     }
 
@@ -2623,6 +2718,12 @@ if ($Command -eq 'review') {
     $res = Get-ReviewFindings $r $def $against
     $err = @($res.findings | Where-Object { $_.severity -eq 'error' }).Count; $warn = @($res.findings | Where-Object { $_.severity -eq 'warning' }).Count
     $dr = Get-DiffRisk $r $def $against; $high = @($dr.risk | Where-Object { $_.level -eq 'high' }).Count
+    if (@((Read-Lessons $r.id).lessons | Where-Object { $_.status -eq 'approved' }).Count) {   # history for lesson -Action report: what was caught, and later fixed
+        $ev = [pscustomobject][ordered]@{ at = (Get-Date).ToString('s'); branch = "$(Invoke-Quiet git -C $r.path rev-parse --abbrev-ref HEAD)"; head = "$(Invoke-Quiet git -C $r.path rev-parse --short HEAD)"
+            findings = @($res.findings | Where-Object { $_.rule -like 'lesson:*' -or $_.rule -like 'custom:*' } | ForEach-Object { "$($_.rule)|$($_.file)" } | Sort-Object -Unique) }
+        New-Item -ItemType Directory -Force $LearningDir | Out-Null
+        [IO.File]::AppendAllText(((Get-LessonFile $r.id) -replace '\.json$', '.events.jsonl'), ($ev | ConvertTo-Json -Compress) + "`n", $Utf8NoBom)
+    }
     [pscustomobject][ordered]@{ status = $(if ($err) { 'FINDINGS' } elseif ($warn) { 'WARNINGS' } else { 'PASSED' }); repo = $r.id
         profile = $(if ($prof.profile) { $prof.profile } else { "none ($($prof.status))" }); scope = $scope; changedFiles = $res.files; csharpFilesReviewed = $res.reviewed; errors = $err; warnings = $warn
         findings = @($res.findings)
@@ -2700,8 +2801,9 @@ if ($Command -eq 'prtext') {
     $md.Add('### Tasks'); $md.Add('| Task | Status |'); $md.Add('|------|--------|')
     foreach ($t in @(Get-PlanTasks (Join-Path $sd 'plan.md') (Read-Workflow))) { $md.Add("| $($t.title) | $($t.status)$(if ($t.detail) { ": $($t.detail)" }) |") }
     $tr = Get-TraceReport $dir $Path
-    $md.Add(''); $md.Add("### Acceptance criteria (trace: $($tr.status))"); $md.Add('| AC | REQ | Status | Tests |'); $md.Add('|----|-----|--------|-------|')
-    foreach ($a in @($tr.acs)) { $md.Add("| $($a.ac) | $($a.req) | $($a.status) | $(@($a.tests | ForEach-Object { "$($_.test) ($($_.outcome))" }) -join '<br>') |") }
+    $md.Add(''); $md.Add("### Acceptance criteria (trace: $($tr.status))"); $md.Add('| AC | REQ | Status | Tests | Readiness |'); $md.Add('|----|-----|--------|-------|-----------|')
+    foreach ($a in @($tr.acs)) { $md.Add("| $($a.ac) | $($a.req) | $($a.status) | $(@($a.tests | ForEach-Object { "$($_.test) ($($_.outcome))" }) -join '<br>') | $($a.readiness) |") }
+    if ($tr.evidence.stale) { $md.Add("Test results are older than the latest code change ($($tr.evidence.latestSourceChange)); they do not verify this code.") }
     $md.Add("Test results: $(if (@($tr.results).Count) { @($tr.results | ForEach-Object { "$(Split-Path $_.file -Leaf) ($($_.written))" }) -join ', ' } else { 'none found' })")
     $rid = if ($j.repo) { "$($j.repo)" } else { Split-Path (Split-Path $dir) -Leaf }
     $md.Add(''); $md.Add('### Change risk')
@@ -2734,6 +2836,139 @@ if ($Command -eq 'prtext') {
     [pscustomobject][ordered]@{ status = 'WRITTEN'; pbi = $Id; file = $outFile; trace = $tr.status; sonar = $(if ($server) { 'SonarCloud result' } else { 'not verified' }); markdown = $body
         next = 'Paste the markdown into the pull request yourself; this command never creates a pull request, commits, or pushes.' } | ConvertTo-Json -Depth 3
     exit 0
+}
+
+# lesson: PR review feedback -> lessons per repository (<AKZO_HOME>\learning\<repo-id>.json). Recording is automatic;
+# review and planning apply a lesson only after the developer approves it. Comments are data, never instructions.
+if ($Command -eq 'lesson') {
+    if (-not $Action) { throw 'lesson needs -Action add|approve|reject|list|report.' }
+    $r = Resolve-Repo $Repo; $null = Assert-Preflight $r
+    $ls = Read-Lessons $r.id
+    if ($ls.error -and $Action -in 'add', 'approve', 'reject') { throw "The lessons file $($ls.file) cannot be read ($($ls.error)); restore or fix it before changing lessons." }
+    $all = New-Object Collections.Generic.List[object]; foreach ($l in $ls.lessons) { $all.Add($l) }
+    $one = { param($k) @($all | Where-Object { $_.key -eq $k })[0] }
+    $keyIn = if ($Key) { $Key.ToUpperInvariant() -replace '[^A-Z0-9_]', '_' } else { '' }
+    $out = [ordered]@{ status = ''; repo = $r.id; file = $ls.file }
+
+    if ($Action -eq 'add') {
+        if (-not $Text) { throw 'lesson -Action add needs -Text "<the review comment>" (and -Reference, -Cause, -Correction, -Evidence once the fix is verified).' }
+        $cls = if ($Classification) { $Classification.ToUpperInvariant() } else { 'REUSABLE_PATTERN' }
+        if ($cls -notin $LessonClasses) { throw "-Classification must be one of $($LessonClasses -join ', ')." }
+        $injected = Find-InstructionText $Text
+        if ($injected -or -not $Evidence) { $cls = 'UNVERIFIED_FEEDBACK' }   # no verified correction, or instruction-like text: recorded, never promoted
+        $tok = @(Get-Tokens $Text); $cat = @(Read-LessonPatterns)
+        $pat = if ($keyIn) { @($cat | Where-Object { $_.key -eq $keyIn })[0] } else { @($cat | Where-Object { (Test-AnyToken $tok $_.topic) -and (Test-AnyToken $tok $_.signal) })[0] }
+        $k = if ($keyIn) { $keyIn } elseif ($pat) { $pat.key } else { '' }
+        if (-not $k) {   # same wording as an earlier lesson of this repository groups with it
+            $bestScore = 0.0
+            foreach ($l in $all) {
+                $lt = @(Get-Tokens (@($l.occurrences | ForEach-Object { $_.comment }) -join ' '))
+                $both = @($tok | Where-Object { $lt -contains $_ }).Count; $union = @(@($tok) + $lt | Sort-Object -Unique).Count
+                if ($union -and ($both / $union) -gt $bestScore) { $bestScore = $both / $union; if ($bestScore -ge 0.3) { $k = $l.key } }
+            }
+        }
+        if (-not $k) {
+            $out.status = 'NEEDS_KEY'; $out.known = @($cat | ForEach-Object { "$($_.key): $($_.title)" }) + @($all | ForEach-Object { "$($_.key): $($_.title)" })
+            $out.next = 'No known pattern or earlier lesson matches. Pass -Key <SHORT_UPPER_CASE_NAME> for a new pattern (with -Title, and -Type reuse-before-new|regex -Query <pattern> when a check can catch it), or the key of the matching lesson.'
+            [pscustomobject]$out | ConvertTo-Json -Depth 4; exit 0
+        }
+        $lchk = if ($Type) { [pscustomobject][ordered]@{ kind = $Type; typePattern = $(if ($Type -eq 'reuse-before-new') { $Query } else { '' }); regex = $(if ($Type -eq 'regex') { $Query } else { '' }); pathGlob = $(if ($Path) { $Path } else { '*' }) } } elseif ($pat) { $pat.check } else { $null }
+        if ($lchk -and ($why = Test-LessonCheck $lchk)) { throw "The check cannot be used: $why." }
+        $comment = Protect-Text $Text; if ($comment.Length -gt 1000) { $comment = $comment.Substring(0, 1000) }
+        $occ = [pscustomobject][ordered]@{ at = (Get-Date).ToString('s'); pbi = $Id; reference = (Protect-Text $Reference); comment = $comment; classification = $cls
+            cause = (Protect-Text $Cause); correction = (Protect-Text $Correction); evidence = $Evidence; instructionLike = $injected }
+        $ex = & $one $k
+        if ($ex) {
+            if (@($ex.occurrences | Where-Object { $_.comment -eq $comment -and $_.reference -eq $occ.reference }).Count) { $out.status = 'DUPLICATE'; $out.lesson = $ex; $out.next = 'This comment is already recorded for this lesson; nothing changed.'; [pscustomobject]$out | ConvertTo-Json -Depth 6; exit 0 }
+            $ex.occurrences = @(@($ex.occurrences) + $occ)
+            $promotable = { param($c) $c -in 'REUSABLE_PATTERN', 'PROJECT_SPECIFIC_RULE' }
+            $clash = @(if ($cls -ne 'UNVERIFIED_FEEDBACK' -and $ex.classification -ne 'UNVERIFIED_FEEDBACK' -and (& $promotable $cls) -ne (& $promotable $ex.classification)) { "classified $($ex.classification) before and $cls now" }
+                if ($lchk -and $ex.check -and (Get-CheckId $lchk) -ne (Get-CheckId $ex.check)) { 'a different check was proposed' })
+            if ($clash.Count) { $ex | Add-Member -Force NoteProperty conflict ($clash -join '; ') }
+            elseif ($ex.classification -eq 'UNVERIFIED_FEEDBACK' -and $cls -ne 'UNVERIFIED_FEEDBACK') {   # the first verified correction completes the lesson
+                foreach ($f in 'classification', 'cause', 'correction', 'evidence') { $ex | Add-Member -Force NoteProperty $f $(if ($f -eq 'classification') { $cls } else { $occ.$f }) }
+                if (-not $ex.check -and $lchk) { $ex | Add-Member -Force NoteProperty check $lchk }
+                if ($ex.status -eq 'unverified') { $ex.status = $(if (& $promotable $cls) { 'proposed' } else { 'recorded' }) }
+            }
+            $out.status = $(if ($clash.Count) { 'CONFLICT' } else { 'GROUPED' }); $lesson = $ex
+        } else {
+            $lesson = [pscustomobject][ordered]@{ key = $k; title = $(if ($Title) { $Title } elseif ($pat) { $pat.title } else { '(no title: pass -Title)' })
+                profile = $(if ($pat -and $pat.profile) { "$($pat.profile)" } elseif ($cls -eq 'PROJECT_SPECIFIC_RULE') { "$((Get-RepoProfile $r '').profile)" } else { 'shared' })
+                classification = $cls; status = $(if ($cls -eq 'UNVERIFIED_FEEDBACK') { 'unverified' } elseif ($cls -in 'REUSABLE_PATTERN', 'PROJECT_SPECIFIC_RULE') { 'proposed' } else { 'recorded' })
+                cause = $occ.cause; correction = $occ.correction; evidence = $Evidence; check = $lchk; createdAt = $occ.at; occurrences = @($occ) }
+            $all.Add($lesson); $out.status = 'RECORDED'
+        }
+        Save-Lessons $ls.file $all
+        $out.lesson = $lesson
+        $out.next = switch ($out.status) {
+            'CONFLICT' { "This feedback conflicts with the lesson ($($lesson.conflict)). Ask the developer which applies; the lesson cannot be approved until it is resolved (reject it, or record the deciding feedback)." }
+            default { if ($lesson.status -eq 'proposed') { "Show the developer the lesson ($($lesson.key): $($lesson.title)), its evidence, and its check; approve it only on their word (lesson -Action approve -Key $($lesson.key))." } else { "Recorded as $($lesson.status) ($($lesson.classification)); it is not proposed as a rule." } } }
+        [pscustomobject]$out | ConvertTo-Json -Depth 6; exit 0
+    }
+
+    if ($Action -in 'approve', 'reject') {
+        if (-not $keyIn) { throw "lesson -Action $Action needs -Key <lesson key>." }
+        $l = & $one $keyIn; if (-not $l) { throw "No lesson '$keyIn' in $($ls.file)." }
+        $out.lesson = $l
+        if ($Action -eq 'reject') {
+            $l.status = 'rejected'; $l | Add-Member -Force NoteProperty decided ([pscustomobject]@{ by = $env:USERNAME; at = (Get-Date).ToString('s'); reason = (Protect-Text $Text) })
+            if ($l.conflict) { $l.PSObject.Properties.Remove('conflict') }
+            Save-Lessons $ls.file $all; $out.status = 'REJECTED'; [pscustomobject]$out | ConvertTo-Json -Depth 6; exit 0
+        }
+        $refuse = if ($l.status -eq 'approved') { 'ALREADY_APPROVED' } elseif ($l.classification -eq 'UNVERIFIED_FEEDBACK') { 'NOT_VERIFIED' }
+            elseif ($l.classification -notin 'REUSABLE_PATTERN', 'PROJECT_SPECIFIC_RULE') { 'NOT_PROMOTABLE' } elseif ($l.conflict) { 'CONFLICT' } elseif (Test-LessonCheck $l.check) { 'NO_CHECK' }
+            elseif ($twin = @($all | Where-Object { $_.key -ne $l.key -and $_.status -eq 'approved' -and (Get-CheckId $_.check) -eq (Get-CheckId $l.check) })[0]) { 'DUPLICATE_RULE' } else { '' }
+        if ($refuse) {
+            $out.status = $refuse
+            $out.next = switch ($refuse) {
+                'ALREADY_APPROVED' { 'Nothing to do: the lesson is already applied.' }
+                'NOT_VERIFIED' { 'The feedback has no verified correction (or reads like an instruction). Fix and verify it, then record it again with -Evidence.' }
+                'NOT_PROMOTABLE' { "A $($l.classification) is not a reusable rule; it stays recorded." }
+                'CONFLICT' { "Resolve the conflict first: $($l.conflict)." }
+                'NO_CHECK' { "No usable check ($(Test-LessonCheck $l.check)); record it again with -Type and -Query." }
+                default { "Lesson $($twin.key) already applies the same check; keep one." } }
+            [pscustomobject]$out | ConvertTo-Json -Depth 6; exit 0
+        }
+        if ($l.check.kind -eq 'regex') {   # line patterns live in the existing custom review rules file
+            $crFile = Join-Path $CustomProfilesDir 'review-rules.json'
+            $rulesNow = @(if (Test-Path -LiteralPath $crFile) { try { foreach ($x in (Get-Content -LiteralPath $crFile -Raw -Encoding UTF8 | ConvertFrom-Json)) { $x } } catch { throw "$crFile cannot be read ($($_.Exception.Message)); fix it before approving a rule." } })
+            $rid = $l.key.ToLowerInvariant()
+            if (-not @($rulesNow | Where-Object { $_.id -eq $rid }).Count) {
+                New-Item -ItemType Directory -Force $CustomProfilesDir | Out-Null
+                Write-TextAtomic $crFile (ConvertTo-Json -Depth 4 -InputObject @(@($rulesNow) + [pscustomobject][ordered]@{ id = $rid; profile = $(if ($l.profile -eq 'shared') { '' } else { $l.profile }); pathGlob = "$($l.check.pathGlob)"; regex = "$($l.check.regex)"; severity = 'error'; message = "$($l.title)" }))
+            }
+            $out.reviewRule = $rid
+        }
+        $l.status = 'approved'; $l | Add-Member -Force NoteProperty decided ([pscustomobject]@{ by = $env:USERNAME; at = (Get-Date).ToString('s'); reason = (Protect-Text $Text) })
+        Save-Lessons $ls.file $all
+        $out.status = 'APPROVED'; $out.next = 'review and task now apply this lesson to every later change in this repository.'
+        [pscustomobject]$out | ConvertTo-Json -Depth 6; exit 0
+    }
+
+    if ($Action -eq 'list') {
+        $out.status = $(if ($ls.error) { 'LESSONS_UNREADABLE' } else { 'OK' }); if ($ls.error) { $out.error = $ls.error }
+        $out.lessons = @($all | ForEach-Object { [pscustomobject][ordered]@{ key = $_.key; title = $_.title; status = $_.status; classification = $_.classification; profile = $_.profile; occurrences = @($_.occurrences).Count; conflict = "$($_.conflict)" } })
+        [pscustomobject]$out | ConvertTo-Json -Depth 4; exit 0
+    }
+
+    # report: learning effectiveness from the lessons and the review history; nothing is estimated.
+    $evFile = (Get-LessonFile $r.id) -replace '\.json$', '.events.jsonl'
+    $events = @(if (Test-Path -LiteralPath $evFile) { foreach ($x in [IO.File]::ReadAllLines($evFile)) { if ($x.Trim()) { try { $x | ConvertFrom-Json } catch { } } } })
+    $detected = @($events | ForEach-Object { @($_.findings) } | Sort-Object -Unique)
+    $prevented = @(foreach ($b in @($events | Group-Object branch)) {   # caught by review, then gone in the branch's latest review: fixed before the PR
+            $last = @($b.Group)[-1]; foreach ($x in @($b.Group | Select-Object -SkipLast 1 | ForEach-Object { @($_.findings) } | Sort-Object -Unique)) { if (@($last.findings) -notcontains $x) { "$($b.Name): $x" } } })
+    $approved = @($all | Where-Object { $_.status -eq 'approved' })
+    $out.status = $(if (-not $approved.Count -or -not $events.Count) { 'NOT_YET_MEASURABLE' } else { 'MEASURED' })
+    $out.report = [ordered]@{
+        commentsAnalyzed = @($all | ForEach-Object { @($_.occurrences) }).Count
+        verifiedPatterns = @($all | Where-Object { $_.classification -in 'REUSABLE_PATTERN', 'PROJECT_SPECIFIC_RULE' }).Count
+        rulesProposed = @($all | Where-Object { $_.status -eq 'proposed' }).Count; rulesApproved = $approved.Count
+        rulesRejectedOrBlocked = @($all | Where-Object { $_.status -eq 'rejected' -or $_.conflict }).Count
+        existingRulesReused = @($approved | Where-Object { $k2 = $_.key; @($detected | Where-Object { $_ -like "lesson:$k2|*" -or $_ -like "custom:$($k2.ToLowerInvariant())|*" }).Count }).Count
+        reviewsRecorded = $events.Count; violationsDetected = $detected.Count; violationsFixedBeforePr = $prevented.Count; fixed = $prevented
+        remainingRecurring = @($all | Where-Object { $_.status -ne 'approved' -and @($_.occurrences).Count -ge 2 } | ForEach-Object { "$($_.key) ($(@($_.occurrences).Count) comments, $($_.status))" }) }
+    $out.next = $(if ($out.status -eq 'NOT_YET_MEASURABLE') { 'LEARNING EFFECTIVENESS: NOT YET MEASURABLE (no approved lesson, or no review run since one was approved).' } else { 'Counts come from the lessons file and the recorded review runs only.' })
+    [pscustomobject]$out | ConvertTo-Json -Depth 5; exit 0
 }
 
 switch ($Command) {
@@ -2911,6 +3146,7 @@ switch ($Command) {
         if ($gv.next) { $info.nextGate = $gv.next }
         $pt = @(Get-PlanTasks $plan $wf); if ($pt.Count) { $info.planTasks = $pt }
         $ap = @(Read-Approvals $dir | Select-Object -Last 5); if ($ap.Count) { $info.approvals = $ap }
+        $lsn = @(Get-LessonSummary $r.id); if ($lsn.Count) { $info.lessons = $lsn }   # approved PR lessons the plan must apply
         $info.evidence = $evidence; $info.created = $created
         $info.git = [ordered]@{
             branch = (Invoke-Quiet git -C $r.path rev-parse --abbrev-ref HEAD); head = (Invoke-Quiet git -C $r.path rev-parse HEAD)
